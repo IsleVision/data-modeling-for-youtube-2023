@@ -1,0 +1,577 @@
+---
+title: "Project2"
+output: html_document
+---
+
+#### Tao SONG (23634999)
+
+### Introduction
+
+The youtube data source is from Kaggle <https://www.kaggle.com/datasets/nelgiriyewithana/global-youtube-statistics-2023> This data set is the same data set I used in project 1. There is also a shiny APP provided. You may watch the demo video (<https://youtu.be/91HwO5XGKCo>) to help you go through the key points.
+
+### Data and libraries set up
+
+Load the required libraries.
+
+```{r, warning=FALSE, message=FALSE}
+library(knitr)
+library(shiny)
+library(ggplot2)
+library(dplyr)
+library(pROC)
+library(ROCR)
+library(ROCit)
+library(pander)
+library(rpart)
+library(class)
+library(crayon)
+library(caret)
+library(FSelector)
+library(gridExtra)
+library(fpc)
+library(ape)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load the data, youtube 2023 and world 2023 data. World 2023 is also from kaggle <https://www.kaggle.com/datasets/nelgiriyewithana/countries-of-the-world-2023> The two data sets are joined by 'Country', and only economic related columns, like 'CPI', 'GDP', 'Total.tax.rate', are introduced from world 2023 data set.
+
+```{r, warning=FALSE}
+youtube_2023data <- read.csv("D:/Downloads/google downloads/data analysis/project2/youtube_UTF_8.csv")
+world_2023data <- read.csv("D:/Downloads/google downloads/data analysis/project2/world-data-2023.csv")
+#convert the columns to easy handling numerical form
+world_2023data <- world_2023data[,c("Country", "CPI", "GDP", "Total.tax.rate")] %>%
+  mutate(CPI = as.numeric(CPI)) %>%
+  mutate(GDP = as.numeric(gsub("[$,]", "", GDP))) %>%
+  mutate(Total.tax.rate = as.numeric(sub('%', '', Total.tax.rate))/ 100)
+
+youtube_2023data <- youtube_2023data %>%
+  left_join(world_2023data[,c("Country", "CPI", "GDP", "Total.tax.rate")], by = "Country")
+```
+
+### Data preprocessing
+
+To facilitate the further operations, first perform some data preprocessing. Below are some key points:
+
+1.  We still process the date the same way as project1 --- combining date, month and year into a date object
+
+2.  'highest_yearly_earnings' is chosen as target variable. To balance the data set, and also set a meaningful value, threshold value is set to 1'000'000. Greater than 1'000'000 is 'high_income'; lower than 1'000'000 is 'low_income'. Values lower than 1000 are filtered out, because it's very abnormal for a top youtuber, owning millions of subscribers, earns so little money. They probably are not for profit, you can hardly predict their earnings if they are not intended to make money. Therefore they should be excluded to avoid influencing our model.
+
+```{r, echo=TRUE, results='hide'}
+Sys.setlocale("LC_TIME", "C")
+attach(youtube_2023data)
+# The 'format' function is added to avoid R transforming Date object to number(number of days from epoch time 1970-01-01)
+created_full_date <- format(as.Date(
+    paste0(created_year, '-', created_month, '-', created_date),
+    "%Y-%b-%d"
+  ))
+detach(youtube_2023data)
+
+table(youtube_2023data$created_full_date < as.Date("2005-2-14"))
+table(youtube_2023data$Gross.tertiary.education.enrollment.... > 100)
+youtube_2023data <- youtube_2023data %>%
+  rename("Gross.tertiary.education.enrollment.percentage" = "Gross.tertiary.education.enrollment....") %>%
+  mutate(created_full_date = format(as.Date(
+    paste0(created_year, '-', created_month, '-', created_date),
+    "%Y-%b-%d"
+  ))) %>%
+  mutate(created_full_date = ifelse(
+    as.Date(created_full_date) < as.Date("2005-2-14"),
+    NA,
+    created_full_date
+  )) %>%  
+  mutate(highest_yearly_earnings_cat = cut(highest_yearly_earnings, breaks = c(1000,1000000,Inf), labels = c('low_income','high_income'))) %>%
+  mutate(years_exist = as.numeric((as.Date('2023-07-1')-as.Date(created_full_date)))/365) %>% 
+  mutate(
+    Gross.tertiary.education.enrollment.percentage = ifelse(
+      Gross.tertiary.education.enrollment.percentage > 100,
+      NA,
+      Gross.tertiary.education.enrollment.percentage
+    )
+  )
+
+#remove NA of target variable
+youtube_2023data <- youtube_2023data[!is.na(youtube_2023data$highest_yearly_earnings_cat), ]
+
+# yearly uploads less than 10 are removed, as these are abnormal cases for top youtubers
+nrow(youtube_2023data[youtube_2023data$uploads==0,])
+youtube_2023data$uploads <- ifelse(youtube_2023data$uploads/as.numeric((as.Date('2023-07-1')-as.Date(youtube_2023data$created_full_date))/365)<10, NA, youtube_2023data$uploads)
+
+# video.views equal to 0 are removed, as these are abnormal cases
+nrow(youtube_2023data[youtube_2023data$video.views==0,])
+youtube_2023data$video.views <- ifelse(youtube_2023data$video.views==0, NA, youtube_2023data$video.views)
+```
+
+Introduce important functions. These are some useful functions originated from lecture slides, some are modified to facilitate operations.
+
+```{r}
+mkPredC <- function(outCol, varCol, appCol, pos) {
+  pPos <- sum(outCol == pos) / length(outCol)
+  naTab <- table(as.factor(outCol[is.na(varCol)]))
+  pPosWna <- (naTab/sum(naTab))[pos]
+  vTab <- table(as.factor(outCol), varCol)
+  pPosWv <- (vTab[pos, ] + 1.0e-3*pPos) / (colSums(vTab) + 1.0e-3)
+  pred <- pPosWv[appCol]
+  pred[is.na(appCol)] <- pPosWna
+  pred[is.na(pred)] <- pPos
+  pred
+}
+
+mkPredN <- function(outCol,varCol,appCol, pos) {
+  cuts <- unique(as.numeric(quantile(varCol, probs=seq(0, 1, 0.1), na.rm=T)))
+  varC <- cut(varCol, cuts)
+  appC <- cut(appCol, cuts)
+  mkPredC(outCol, varC, appC, pos)
+}
+
+calcAUC <- function(predcol,outcol, pos) {
+  perf <- performance(prediction(predcol,outcol==pos),'auc')
+  as.numeric(perf@y.values)
+}
+
+plot_roc <- function(predcol1, outcol1, legend1, predcol2, outcol2, legend2){
+    roc_1 <- rocit(score=predcol1, class=outcol1==pos)
+    roc_2 <- rocit(score=predcol2, class=outcol2==pos)
+    plot(roc_1, col = c("blue","green"), lwd = 3,
+      legend = FALSE,YIndex = FALSE, values = TRUE, asp=1)
+    lines(roc_2$TPR ~ roc_2$FPR, lwd = 3, 
+          col = c("red","green"), asp=1)
+    legend("bottomright", col = c("blue","red", "green"),
+       c(legend1, legend2, "Null Model"), lwd = 2)
+}
+
+logLikelihood <- function(ytrue, ypred, epsilon=1e-6) {
+sum(ifelse(ytrue==pos, log(ypred+epsilon), log(1-ypred-epsilon)), na.rm=T)
+}
+
+performanceMeasures <- function(ytrue, ypred, model.name = "model", threshold=0.5) {
+   logLikelihood <- logLikelihood(ytrue, ypred)
+   dev.norm <- -2 * logLikelihood(ytrue, ypred)/length(ypred)
+   cmat <- table(actual = ytrue, predicted = ypred>0.5)
+   accuracy <- sum(diag(cmat)) / sum(cmat)
+   precision <- cmat[2, 2] / sum(cmat[, 2])
+   recall <- cmat[2, 2] / sum(cmat[2, ])
+   f1 <- 2 * precision * recall / (precision + recall)
+   data.frame(model = model.name, precision = precision,
+              recall = recall, f1 = f1, logLikelihood = logLikelihood, dev.norm = dev.norm)
+}
+
+panderOpt <- function(){
+  panderOptions("plain.ascii", TRUE)
+  panderOptions("keep.trailing.zeros", TRUE)
+  panderOptions("table.style", "simple")
+  
+}
+
+pretty_perf_table <- function(xpred, xtrue, xlegend,
+                              ypred, ytrue, ylegend) {
+   panderOpt()
+   perf_justify <- "lrrrrr" 
+
+   xperf_df <- performanceMeasures(
+      xtrue, xpred, model.name=xlegend)
+   yperf_df <- performanceMeasures(
+      ytrue, ypred, model.name=ylegend)
+
+   perftable <- rbind(xperf_df, yperf_df)
+   pandoc.table(perftable, justify = perf_justify)
+}
+
+```
+
+### Classification
+
+#### Single Variable Models
+
+Remove some rank and id columns from candidate feature columns; and earnings related columns are also removed, as they should be duplicate to our target variable. Data set is split into training, calibration and test with 8:1:1 ratio, using random separation method with an initial seed to ensure reproducibility.
+
+```{r}
+outcome <- 'highest_yearly_earnings_cat'
+pos <- 'high_income'
+
+vars <- setdiff(colnames(youtube_2023data), c('lowest_monthly_earnings', 'highest_monthly_earnings', 'lowest_yearly_earnings', 'highest_yearly_earnings', 'rank', 'Youtuber', 'Title', 'channel_type_rank', 'video_views_rank', 'country_rank', outcome))
+catVars <- vars[sapply(youtube_2023data[,vars], class) %in% 
+                  c('factor','character')]
+
+numericVars <- vars[sapply(youtube_2023data[,vars], class) %in%
+                      c('numeric','integer')]
+
+feature_catVars <- catVars
+feature_numericVars <- numericVars
+
+set.seed(4009)
+random <- runif(dim(youtube_2023data)[[1]])
+dTrain <- subset(youtube_2023data,random<=0.8)
+dCal  <- subset(youtube_2023data,random>0.8&random<0.9)
+dTest <- subset(youtube_2023data,random>=0.9)
+
+dTrainAll <- rbind(dTrain,dCal)
+```
+
+Evaluation of Null model. Null model will work as a benchmark for performance check, other models should outperform the Null model.
+
+```{r}
+Npos <- sum(dTrain[,outcome] == pos)
+pred.Null <- Npos / nrow(dTrain)
+cat("Proportion of outcome == 'high_income' in dTrain:", pred.Null, "\n")
+TP <- 0; TN <- sum(dCal[,outcome] == 'low_income');
+FP <- 0; FN <- sum(dCal[,outcome] == pos);
+cat("nrow(dCal):", nrow(dCal), "TP:", TP, "TN:", TN, "FP:", FP, "FN:", FN, "\n")
+cat("accuracy(TN+TP/TN+FP+TP+FN):",accuracy <- (TP + TN) / nrow(dCal), "\n")
+cat("precision(TP/TP+FP):",precision <- TP/(TP + FP), "\n")
+cat("recall(TP/TP+FN):",recall <- TP/(TP + FN), "\n")
+pred.Null <- rep(pred.Null, nrow(dCal))
+AUC.Null <- calcAUC(pred.Null, dCal[,outcome], pos)
+print(sprintf("Null model AUC: %4.3f", AUC.Null))
+```
+
+Evaluation of all the categorical single variables
+
+```{r}
+for(feature_catVar in feature_catVars) {
+  pred <- paste('pred_', feature_catVar, sep='')
+  dTrain[,pred] <- mkPredC(dTrain[,outcome], dTrain[,feature_catVar], dTrain[,feature_catVar], pos)
+  dCal[,pred] <- mkPredC(dTrain[,outcome], dTrain[,feature_catVar], dCal[,feature_catVar], pos)
+  dTest[,pred] <- mkPredC(dTrain[,outcome], dTrain[,feature_catVar], dTest[,feature_catVar], pos)
+}
+
+for(feature_catVar in feature_catVars) {
+  pred <- paste('pred_', feature_catVar, sep='')
+  aucTrain <- calcAUC(dTrain[,pred], dTrain[,outcome], pos)
+  if (aucTrain >= 0.55) {
+    aucCal <- calcAUC(dCal[,pred], dCal[,outcome], pos)
+    aucTest <- calcAUC(dTest[,pred], dTest[,outcome], pos)
+    print(sprintf(
+      "%s: trainAUC: %4.3f; calibrationAUC: %4.3f; testAUC: %4.3f",
+      feature_catVar, aucTrain, aucCal, aucTest))
+  }
+}
+```
+
+Run 100 fold cross validation for categorical single variables
+
+```{r}
+for (feature_catVar in feature_catVars) {
+  aucs <- rep(0,100)
+  for (rep in 1:length(aucs)) {
+    useForCalRep <- rbinom(n=nrow(dTrainAll), size=1, prob=0.1) > 0
+    predRep <- mkPredC(dTrainAll[!useForCalRep, outcome],
+                     dTrainAll[!useForCalRep, feature_catVar],
+                     dTrainAll[useForCalRep, feature_catVar], pos)
+    aucs[rep] <- calcAUC(predRep, dTrainAll[useForCalRep, outcome], pos)
+  }
+  print(sprintf("%s: mean: %4.3f; sd: %4.3f", feature_catVar, mean(aucs), sd(aucs)))
+}
+```
+
+Evaluation of all the numerical single variables
+
+```{r}
+for(feature_numericVar in feature_numericVars) {
+  pred <- paste('pred_', feature_numericVar, sep='')
+  dTrain[,pred] <- mkPredN(dTrain[,outcome], dTrain[,feature_numericVar], dTrain[,feature_numericVar], pos)
+  dCal[,pred] <- mkPredN(dTrain[,outcome], dTrain[,feature_numericVar], dCal[,feature_numericVar], pos)
+  dTest[,pred] <- mkPredN(dTrain[,outcome], dTrain[,feature_numericVar], dTest[,feature_numericVar], pos)
+  aucTrain <- calcAUC(dTrain[,pred], dTrain[,outcome], pos)
+  
+  if(aucTrain >= 0.55) {
+    aucCal <- calcAUC(dCal[,pred], dCal[,outcome], pos)
+    aucTest <- calcAUC(dTest[,pred], dTest[,outcome], pos)
+    print(sprintf(
+      "%s: trainAUC: %4.3f; calibrationAUC: %4.3f; TestAUC: %4.3f",
+      feature_numericVar, aucTrain, aucCal, aucTest))
+  }
+}
+```
+
+Here we can see some very promising variables, such as video_views_for_the_last_30_days, subscribers_for_last_30_days, resulting in an AUC over 0.9. They alone can form super accurate single variable models to predict the target variable. Initially it's hard for me to understand why the most recent month's performance is such a strong indicator of 'highest yearly earnings'. However if we find the ratios of the below ones, we understand that top youtubers' earnings are somehow stable --- in 'highest yearly earnings' year, they made 'highest earnings' almost every month, and in 'lowest yearly earnings' year, they made 'lowest earnings' every month. They seem to have been making constant efforts, but their earnings are basically determined by the external factors, may be platform policy, overall economic condition, etc. Their earnings got the similar percentage impacts in the 'high earning' and 'low earning' years, and very likely they experienced 'highest' and 'lowest' earnings in the same years; and this year, year 2023, is the year they are making the 'highest earnings', so the 'most recent month' performance become the deciding factor.
+
+```{r}
+ratio1 <- youtube_2023data['highest_yearly_earnings']/youtube_2023data['highest_monthly_earnings']
+table(ratio1>11 & ratio1<13)
+ratio2 <- youtube_2023data['lowest_yearly_earnings']/youtube_2023data['lowest_monthly_earnings']
+table(ratio2>11 & ratio2<13)
+ratio3 <- youtube_2023data['highest_yearly_earnings']/youtube_2023data['lowest_yearly_earnings']
+table(ratio3<17&ratio3>15)
+ratio4 <- youtube_2023data['highest_monthly_earnings']/youtube_2023data['lowest_monthly_earnings']
+table(ratio4<17&ratio4>15)
+sorted_date <- sort(youtube_2023data$created_full_date)
+```
+
+Run 100 fold cross validation for numerical single variables
+
+```{r}
+for (feature_numericVar in feature_numericVars) {
+  aucs <- rep(0,100)
+  for (rep in 1:length(aucs)) {
+    useForCalRep <- rbinom(n=nrow(dTrainAll), size=1, prob=0.1) > 0
+    predRep <- mkPredN(dTrainAll[!useForCalRep, outcome],
+                     dTrainAll[!useForCalRep, feature_numericVar],
+                     dTrainAll[useForCalRep, feature_numericVar], pos)
+    aucs[rep] <- calcAUC(predRep, dTrainAll[useForCalRep, outcome], pos)
+  }
+  print(sprintf("%s: mean: %4.3f; sd: %4.3f", feature_numericVar, mean(aucs), sd(aucs)))
+}
+```
+
+#### Multiple Variable Models
+
+Defining runDecisionTree and run_knn functions for later use. KNN and decision trees (RPART) are generally considered self-explainable, as they provide straightforward models, and are easy to understand.
+
+```{r, warning=FALSE}
+runDecisionTree <- function(multi_vars, display=TRUE){
+fV <- paste(outcome,'=="high_income" ~ ',
+             paste(multi_vars, collapse=' + '), sep='')
+## parameters like cp, minsplit, minbucket, maxdepth are set based on the volume of the data and the compromises of the computing complexity, balance between overfitting and underfitting
+tmodel <- rpart(as.formula(fV), data=na.omit_dTrain
+                ,control=rpart.control(cp=0.001, minsplit=15,
+                                  minbucket=10, maxdepth=6))
+
+pred_train_roc <- predict(tmodel, newdata=na.omit_dTrain)
+pred_cal_roc <- predict(tmodel, newdata=na.omit_dCal)
+pred_test_roc <- predict(tmodel, newdata=na.omit_dTest)
+
+dt_train_auc <- calcAUC(pred_train_roc, na.omit_dTrain[,outcome], pos)
+dt_test_auc <- calcAUC(pred_test_roc, na.omit_dTest[,outcome], pos)
+if(!display){
+  return(dt_test_auc)
+}
+
+if(display){
+  cat("Train AUC: ",dt_train_auc,"\n")
+cat("Test AUC: ",dt_test_auc)
+plot_roc(pred_test_roc, na.omit_dTest[[outcome]], "Test Data",
+         pred_train_roc, na.omit_dTrain[[outcome]], "Training Data")
+pretty_perf_table(pred_train_roc, na.omit_dTrain[outcome]==pos, 'training', pred_test_roc, na.omit_dTest[,outcome]==pos, 'test')
+}
+
+}
+
+
+run_knn <- function(multi_vars, display=TRUE, k=10){
+  calc_knnProb <- function(dTrain, df){
+    ## parameter k is the number of nearest neighbors to consider when making a classification. Still should consider data set size and computing complexity, balance between overfitting and underfitting
+  knnPred <- knn(na.omit_dTrain[multi_vars], df[multi_vars], na.omit_dTrain[,outcome], k=k, prob=T)
+  knnProb <- attributes(knnPred)$prob 
+  knnProb <- ifelse(knnPred == "high_income", knnProb, 1-knnProb)
+  }
+  
+knnPred <- knn(na.omit_dTrain[multi_vars], na.omit_dCal[multi_vars], na.omit_dTrain[,outcome], k=k, prob=T)
+
+knnProb_cal <- calc_knnProb(na.omit_dTrain[multi_vars], na.omit_dCal[multi_vars])
+knnProb_test <- calc_knnProb(na.omit_dTrain[multi_vars], na.omit_dTest[multi_vars])
+
+knn_cal_auc <- calcAUC(knnProb_cal, na.omit_dCal[,outcome], pos)
+knn_test_auc <- calcAUC(knnProb_test, na.omit_dTest[,outcome], pos)
+if(!display){
+  return(knn_test_auc)
+}
+if(display){
+  cat("Calibration AUC: ",knn_cal_auc,"\n")
+cat("Test AUC: ",knn_test_auc)
+
+plot_roc(knnProb_test, na.omit_dTest[[outcome]], "Test Data",
+         knnProb_cal, na.omit_dCal[[outcome]], "Calibration Data")
+
+pretty_perf_table(knnProb_cal, na.omit_dCal[outcome]==pos, 'calibration', knnProb_test, na.omit_dTest[,outcome]==pos, 'test')
+}
+
+}
+
+```
+
+Next we perform list-wise deletion for training, calibration and test data sets. We do not use imputation methods as we want to make sure the data source are reliable and do not want to bring in disturbance.
+
+We use FSelector library to calculate the Information Gain values. The information.gain basically calculate the entropy between the attribute and the target variable. Then sort them from high to low, and select the top 3 attributes, based on their entropy values and also considering the features complexity.
+
+The 3 selected feature variables are 'video_views_for_the_last_30_days'(rank 1), 'pred_created_full_date'(rank 3), 'subscribers_for_last_30_days'(rank 5). 'created_full_date'(rank 2) is discarded, as categorical variable is not compatible with knn, and this variable can bring in many distinct categories. 'pred_video_views_for_the_last_30_days'(rank 4) is also discarded, as it should be duplicate to 'video_views_for_the_last_30_days'.
+
+Then run the knn and decision tree models with the selected 3 variables, we find the model performance is kind of exactly accurate, though we know 'video_views_for_the_last_30_days' alone can predict results fairly precisely.
+
+```{r , warning=FALSE}
+multi_vars <- c(feature_catVars, feature_numericVars)
+pred_multi_vars <- paste('pred_', multi_vars, sep='')
+
+na.omit_dTrain <- na.omit(dTrain[,c(multi_vars,pred_multi_vars,outcome)])
+na.omit_dCal <- na.omit(dCal[,c(multi_vars,pred_multi_vars,outcome)])
+na.omit_dTest <- na.omit(dTest[,c(multi_vars,pred_multi_vars,outcome)])
+
+# Calculate Information Gain for each feature
+info_gain <- information.gain(highest_yearly_earnings_cat ~ ., na.omit_dTrain)
+info_gain$row.names <- setdiff(colnames(na.omit_dTrain), outcome)
+
+# Sort the data frame based on the sorted order
+sorted_df <- info_gain[order(info_gain[, "attr_importance"], decreasing = TRUE), ]
+sorted_df[0:10, ]
+
+run_knn(c('video_views_for_the_last_30_days', 'pred_created_full_date', 'subscribers_for_last_30_days'))
+runDecisionTree(c('video_views_for_the_last_30_days', 'pred_created_full_date', 'subscribers_for_last_30_days'))
+```
+
+Another feature selection technique used here is Forward Selection. It generally start from empty set, then add a new feature in each loop as long as the new combination can bring performance improvement. We here use AUC as the metric for performance evaluation.
+
+Categorical variables are transformed into representing numerical ones for knn methods, as knn should only accept numeric attributes.
+
+Both the knn and decision tree model select a single 'video_views_for_the_last_30_days' as final feature variables. Execute these 2 models with this variable and again we get very high accurate performance.
+
+```{r, warning=FALSE}
+selected_feature_catVars <- c("category", "Country", "channel_type")
+pred_selected_feature_catVars <- paste('pred_', selected_feature_catVars, sep='')
+features <-c(selected_feature_catVars, feature_numericVars)
+
+# this for loop is to make sure test data set does not contain different categorical values that are not in the training set. Otherwise, the decision tree method will raise an error. 
+for (feature_catVar in selected_feature_catVars) {
+  na.omit_dTest <-
+    na.omit_dTest[na.omit_dTest[[feature_catVar]] %in% unique(na.omit_dTrain[[feature_catVar]]), ]
+  na.omit_dCal <-
+    na.omit_dCal [na.omit_dCal [[feature_catVar]] %in% unique(na.omit_dTrain[[feature_catVar]]), ]
+}
+
+run_forward_selection <- function(features, func) {
+  selected_features <- NULL
+  best_auc <- -Inf
+  # Perform forward selection
+  for (i in 1:length(features) - 1) {
+    best_auc_inner <- best_auc
+    best_feature <- NULL
+    for (feature in setdiff(features, selected_features)) {
+      current_features <- c(selected_features, feature)
+      current_auc <- func(current_features, display = FALSE)
+      if (current_auc > best_auc_inner) {
+        best_auc_inner <- current_auc
+        best_feature <- feature
+      }
+    }
+    if (best_auc_inner > best_auc) {
+      best_auc <- best_auc_inner
+      selected_features <- c(selected_features, best_feature)
+    }
+    else{
+      break
+    }
+  }
+  
+  cat(deparse(substitute(func)), ",final selected features:",
+      paste(selected_features, collapse = ","),
+      "\n")
+  func(selected_features, display = T)
+  
+}
+
+run_forward_selection(features,runDecisionTree)
+run_forward_selection(c(pred_selected_feature_catVars,feature_numericVars),run_knn)
+
+```
+
+### Clustering
+
+Defining some useful methods from lecture slides.
+
+```{r}
+sqr_euDist <- function(x, y) {
+    sum((x - y)^2)
+}
+
+wss <- function(clustermat) {
+    c0 <- colMeans(clustermat)
+    sum(apply( clustermat, 1, FUN=function(row) {sqr_euDist(row, c0)} ))
+}
+
+wss_total <- function(scaled_df, labels) {
+    wss.sum <- 0
+    k <- length(unique(labels))
+    for (i in 1:k) 
+        wss.sum <- wss.sum + wss(subset(scaled_df, labels == i))
+    wss.sum
+}
+
+tss <- function(scaled_df) {
+   wss(scaled_df)
+}
+
+CH_index <- function(scaled_df, kmax, method="kmeans") {
+    if (!(method %in% c("kmeans", "hclust"))) 
+        stop("method must be one of c('kmeans', 'hclust')")
+    npts <- nrow(scaled_df)
+    wss.value <- numeric(kmax) 
+    wss.value[1] <- wss(scaled_df)
+
+    if (method == "kmeans") {
+        # kmeans
+        for (k in 2:kmax) {
+            clustering <- kmeans(scaled_df, k, nstart=10, iter.max=100)
+            wss.value[k] <- clustering$tot.withinss
+        } 
+    } else {
+        # hclust
+        d <- dist(scaled_df, method="euclidean")
+        pfit <- hclust(d, method="ward.D2")
+        for (k in 2:kmax) {
+            labels <- cutree(pfit, k=k)
+            wss.value[k] <- wss_total(scaled_df, labels)
+        }
+    }
+    bss.value <- tss(scaled_df) - wss.value   
+    B <- bss.value / (0:(kmax-1))             
+    W <- wss.value / (npts - 1:kmax)          
+
+    data.frame(k = 1:kmax, CH_index = B/W, WSS = wss.value)
+}
+```
+
+For clustering, we will combine training, calibration and test data sets together. The CH index and wss plots can help us find the optimal k value. In this case, k=2 should be the optimal value, it reflects the highest CH value and the wss plot seems constantly descending and does not give much info.
+
+```{r, warning=FALSE}
+df <- rbind(na.omit_dTrain, na.omit_dCal, na.omit_dTest)
+# similar to knn, only numeric values are allowed
+scaled_df <- scale(df[,c(pred_selected_feature_catVars,feature_numericVars)])
+
+# calculate the CH criterion
+crit.df <- CH_index(scaled_df, 10, method="hclust")
+
+fig1 <- ggplot(crit.df, aes(x=k, y=CH_index)) +
+  geom_point() + geom_line(colour="red") + 
+  scale_x_continuous(breaks=1:10, labels=1:10) +
+  labs(y="CH index") + theme(text=element_text(size=20))
+
+fig2 <- ggplot(crit.df, aes(x=k, y=WSS), color="blue") +
+  geom_point() + geom_line(colour="blue") + 
+  scale_x_continuous(breaks=1:10, labels=1:10) +
+  theme(text=element_text(size=20))
+
+grid.arrange(fig1, fig2, nrow=1)
+```
+
+Next we can draw a clustering tree, and use 2 rectangles to frame the 2 groups. However, due to the large size of the data set, the graph is basically illegible.
+
+```{r, warning=FALSE}
+##using dist function to calculate the distance matrix. ec
+d <- dist(scaled_df, method="euclidean")
+
+pfit <- hclust(d, method="ward.D2") 
+plot(as.phylo(pfit), labels=df$highest_yearly_earnings_cat,  cex = 0.3, direction = "right", main="Cluster Dendrogram for Youtube 2023")
+
+rect.hclust(pfit, k=2) 
+
+print_clusters <- function(df, groups, cols_to_print) {
+  Ngroups <- max(groups) 
+  for (i in 1:Ngroups) {
+    print(paste("cluster", i))
+    print(df[groups == i, cols_to_print])
+  }
+}
+```
+
+We can label each group using 'Country' or 'highest_yearly_earnings_cat'. The result shows the clustering essentially separate the data sets into US and non-US groups, which denotes the data pattern similarities within US country are higher than that in the other countries. Maybe if originally we choose 'Country' as target variable and use other columns to predict whether it's US or non-US, we also can get very precise models.
+
+```{r , warning=FALSE}
+cboot.hclust <- clusterboot(scaled_df, clustermethod=hclustCBI,
+			    method="ward.D2", k=2, silent = TRUE)
+summary(cboot.hclust$result)
+groups.cboot <- cboot.hclust$result$partition
+table(df[groups.cboot==1,"highest_yearly_earnings_cat"])
+table(df[groups.cboot==2,"highest_yearly_earnings_cat"])
+print_clusters(df, groups.cboot, "Country")
+table(df[groups.cboot==1,"Country"])
+table(df[groups.cboot==2,"Country"])
+sum(df[groups.cboot==2,"Country"]=="United States")
+```
